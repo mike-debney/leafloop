@@ -14,6 +14,11 @@
  * - https://github.com/openvehicles/Open-Vehicle-Monitoring-System/blob/master/vehicle/OVMS.X/vehicle_nissanleaf.c
  * - ... and a lot of time looking through CAN messages the hard way!
  *
+ * Known issues:
+ * - temperatures do not seem to be correct in all situations
+ * - because CAN bus goes quiet while car is off, SOC does not update while charging and car is off
+ * - lights and doors parsing needs further work
+ *
  * Disclaimer - no warranty is implied, use at your own risk - messing around with your car's computer systems could be dangerous!!
  *
  * Copyright 2019 Mike Debney
@@ -547,7 +552,7 @@ void parse625(unsigned char* data) {
     int prevFogLightsOn = fogLightsOn;
 
     lights = data[1];
-    switch(lights) {  // this needs more research
+    switch(lights) {
         case 0x40:
             headlightsOn = 0;
             parkingLightsOn = 1;

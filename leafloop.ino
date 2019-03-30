@@ -140,7 +140,7 @@ void setup()
     Particle.variable("hv_soc", &hvSoc, DOUBLE);
     Particle.variable("hv_soh", &hvSoh, INT);
     Particle.variable("hv_kwh", &hvKwh, DOUBLE);
-    Particle.variable("hv_v", &hvV, DOUBLE);
+    Particle.variable("hv_temp_c", &hvTempC, DOUBLE);
     Particle.variable("range_km", &range, INT);
     Particle.variable("dc_qc", &dcqc, INT);
     Particle.variable("l2_l1", &l2l1, INT);
@@ -237,7 +237,7 @@ void loop() {
 
 void publishEvent(String event, String params) {
     if (Particle.connected()) {
-        Particle.publish(event, params, 60, PRIVATE);
+        Particle.publish("event", event + ":" + params, 60, PRIVATE);
     }
 }
 
@@ -512,7 +512,7 @@ void parse60d(unsigned char* data) {
         || doorRL != prevDoorRL
         || doorFR != prevDoorFR
         || doorFL != prevDoorFL) {
-        publishEvent("doors", String(doors));
+        publishEvent("doors", String(doorR || doorRR || doorRL || doorFR|| doorFL));
     }
     
     int prevLocked = isLocked;
@@ -547,7 +547,7 @@ void parse625(unsigned char* data) {
     int prevFogLightsOn = fogLightsOn;
 
     lights = data[1];
-    switch(lights) {
+    switch(lights) {  // this needs more research
         case 0x40:
             headlightsOn = 0;
             parkingLightsOn = 1;
@@ -574,7 +574,7 @@ void parse625(unsigned char* data) {
     if (prevHeadlightsOn != headlightsOn
         || prevParkingLightsOn != parkingLightsOn
         || prevFogLightsOn != fogLightsOn) {
-        publishEvent("lights", String(lights));
+        publishEvent("lights", String(headlightsOn || parkingLightsOn || fogLightsOn));
     }
 }
 
@@ -752,22 +752,3 @@ void pollVcm(bool nextPage) {
     message.data[7] = 0x00;
     carloop.can().transmit(message);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

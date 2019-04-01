@@ -52,10 +52,13 @@ Carloop<CarloopRevision2> carloop;
 
 bool SERIAL_DEBUG = false;  // turn this on to print current status on serial port - however this will stop the GPS from working
 
+int lastEventSent = 0;
+const int eventInterval = 300;
+
 int lastWakeUp = 0;
 int lastMessage = 0;
+
 int lastPoll = 0;
-int lastUpdate = 0;
 const int pollInterval = 60;
 
 bool issuePoll = false;
@@ -77,7 +80,7 @@ double quality = -1;
 double accBatteryVoltage;
 
 bool isConnected = false;
-bool hasLocation = false;
+int hasLocation = 0;
 double lat;
 double lng;
 
@@ -93,7 +96,7 @@ double hvFullSoc = -1;
 double hvV = -1;
 double hvAh = -1;
 double hvHx = -1;
-double hvTempC = -100;
+double hvTempC = -1;
 double accV = -1;
 
 int outsideTempC = -100;
@@ -111,6 +114,7 @@ int isChargingAc = -1;
 
 int lights = -1;
 int headlightsOn = -1;
+int highBeamLightsOn = -1;
 int parkingLightsOn = -1;
 int fogLightsOn = -1;
 
@@ -125,20 +129,19 @@ int isLocked = -1;
 
 void setup()
 {
-    Cellular.setBandSelect("900"); 
     Serial.begin(9600);
     
     // expose variables to particle's cloud (maximum of 20 allowed)
     Particle.variable("total_uptime", &uptime, INT);
     Particle.variable("connected_uptime", &connectedUptime, INT);
     Particle.variable("signal_strength", &strength, DOUBLE);
-    Particle.variable("signal_quality", &quality, DOUBLE);
     
     Particle.variable("acc_batt_v", &accBatteryVoltage, DOUBLE);
     Particle.variable("car_state", &carState, STRING);
     Particle.variable("prndb", &prndb, STRING);
     Particle.variable("odo_km", &odoKm, INT);
     
+    Particle.variable("gps_lock", &hasLocation, INT);
     Particle.variable("gps_lat", &lat, DOUBLE);
     Particle.variable("gps_lng", &lng, DOUBLE);
 
@@ -153,8 +156,7 @@ void setup()
     Particle.variable("lights", &lights, INT);
     Particle.variable("doors", &doors, INT);
     Particle.variable("locked", &isLocked, INT);
-    
-    // allow remote query of on board computer systems
+
     Particle.function("refresh", refreshCommand);
     
     // add CANBUS filters for just the messages we care about
@@ -227,7 +229,8 @@ void loop() {
     
     // update gps location
     updateLocation(!wasConnected && isConnected
-        || (previousCarState != carState && carState != "ACC")); 
+        || (previousCarState != carState && carState == "ON")
+        || (previousPrndb != prndb && prndb == "P")); 
     
     // publish SoC when car turns on or off
     if (hvSoc > 0 && previousCarState != carState && carState != "ACC") { 
@@ -241,8 +244,15 @@ void loop() {
 }
 
 void publishEvent(String event, String params) {
+    if (lastEventSent + eventInterval > System.uptime()) {  // throttle calls to publish to get around rate limits
+        delay(eventInterval);
+    }
+    
     if (Particle.connected()) {
-        Particle.publish("event", event + ":" + params, 60, PRIVATE);
+        bool result = Particle.publish("event", event + ":" + params, 60, PRIVATE);
+        if (result) {
+            lastEventSent = System.uptime();
+        }
     }
 }
 
@@ -273,7 +283,16 @@ void publishSerial() {
     Serial.printlnf("Fast Charges %d", dcqc);
     Serial.printlnf("Slow Charges %d", l2l1);
     Serial.printlnf("Lights %d", lights);
+    Serial.printlnf("Light Headlights %d", headlightsOn);
+    Serial.printlnf("Light Highbeams %d", highBeamLightsOn);
+    Serial.printlnf("Light Parking %d", parkingLightsOn);
+    Serial.printlnf("Light Fog %d", fogLightsOn);
     Serial.printlnf("Doors %d", doors);
+    Serial.printlnf("Door R %d", doorR);
+    Serial.printlnf("Door RR %d", doorRR);
+    Serial.printlnf("Door RL %d", doorRL);
+    Serial.printlnf("Door FR %d", doorFR);
+    Serial.printlnf("Door FL %d", doorFL);
     Serial.printlnf("Locked %d", isLocked);
 }
 
@@ -290,10 +309,10 @@ void updateLocation(bool forceSend) {
             if (!hasLocation || forceSend) {
                 publishEvent("location", String(lat) + ", " + String(lng));
             }
-            hasLocation = true;
+            hasLocation = 1;
         }
         else {
-            hasLocation = false;
+            hasLocation = 0;
         }
     } 
 }
@@ -500,24 +519,24 @@ void parse79a(unsigned char* data) {
 }
 
 void parse60d(unsigned char* data) {
-    int prevDoor = doors;
-    int prevDoorR = doorR;
-    int prevDoorRR = doorRR;
-    int prevDoorRL = doorRL;
-    int prevDoorFR = doorFR;
-    int prevDoorFL = doorFL;
-    doors = data[0];
-    doorR = (data[0] & 0x80) != 0x00;
-    doorRR = (data[0] & 0x40) != 0x00;
-    doorRL = (data[0] & 0x20) != 0x00;
-    doorFR = (data[0] & 0x10) != 0x00;
-    doorFL = (data[0] & 0x08) != 0x00;
-    if (doorR != prevDoorR
-        || doorRR != prevDoorRR
-        || doorRL != prevDoorRL
-        || doorFR != prevDoorFR
-        || doorFL != prevDoorFL) {
-        publishEvent("doors", String(doorR || doorRR || doorRL || doorFR|| doorFL));
+    // doors - first byte of 0x60d
+    // all closed   00000000    0x00
+    // front left   00001000    0x08
+    // front right  00010000    0x10
+    // rear left    00100000    0x20
+    // rear right   01000000    0x40
+    // boot         10000000    0x80
+    
+    int prevDoors = doors;
+    
+    doors = (data[0] & 0xf8) > 0x00; // any door open
+    doorR = (data[0] & 0x80) > 0x00;
+    doorRR = (data[0] & 0x40) > 0x00;
+    doorRL = (data[0] & 0x20) > 0x00;
+    doorFR = (data[0] & 0x10) > 0x00;
+    doorFL = (data[0] & 0x08) > 0x00;
+    if (doors != prevDoors) {
+        publishEvent("doors", String(doors));
     }
     
     int prevLocked = isLocked;
@@ -547,39 +566,25 @@ void parse60d(unsigned char* data) {
 }
 
 void parse625(unsigned char* data) {
-    int prevHeadlightsOn = headlightsOn;
-    int prevParkingLightsOn = parkingLightsOn;
-    int prevFogLightsOn = fogLightsOn;
-
-    lights = data[1];
-    switch(lights) {
-        case 0x40:
-            headlightsOn = 0;
-            parkingLightsOn = 1;
-            fogLightsOn = 0;
-            break;
-        case 0x60:
-            headlightsOn = 1;
-            parkingLightsOn = 1;
-            fogLightsOn = 0;
-            break;
-        case 0x68:
-            headlightsOn = 1;
-            parkingLightsOn = 1;
-            fogLightsOn = 1;
-            break;
-        case 0x00:
-        default:
-            headlightsOn = 0;
-            parkingLightsOn = 0;
-            fogLightsOn = 0;
-            break;
-    }
+    // lights - second byte of 0x625
+    // all off          00000000    0x00
+    // parking          ‭01000000‬    0x40
+    // lights           0‭1100000‬    0x60
+    // full             ‭01010000‬    0x50
+    // parking + fog    ‭01001000‬    0x48
+    // lights + fog     ‭01101000‬    0x68
+    // full + fog       ‭01011000‬    0x58
     
-    if (prevHeadlightsOn != headlightsOn
-        || prevParkingLightsOn != parkingLightsOn
-        || prevFogLightsOn != fogLightsOn) {
-        publishEvent("lights", String(headlightsOn || parkingLightsOn || fogLightsOn));
+    int prevLightsOn = lights;
+        
+    parkingLightsOn = (data[1] & 0x40) > 0x00;
+    fogLightsOn = (data[1] & 0x08) > 0x00;
+    headlightsOn = (data[1] & 0x20) > 0x00;
+    highBeamLightsOn = (data[1] & 0x10) > 0x00;
+    lights = (data[1] & 0x78) > 0x00;  // any lights on
+   
+    if (prevLightsOn != lights) {
+        publishEvent("lights", String(lights));
     }
 }
 

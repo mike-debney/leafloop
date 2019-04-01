@@ -65,7 +65,9 @@ def createChildDevices() {
                 ]).save()
                 child = getChildDevice(child_dni)
             }
-            pollChildDevice(child)
+            if (child) {
+            	pollChildDevice(child)
+            }
         }
     }
 }

@@ -46,14 +46,19 @@
 
 SYSTEM_THREAD(ENABLED);  // make sure code still runs while disconnected
 
+#if Wiring_Cellular
 STARTUP(cellular_credentials_set("internet", "", "", NULL));  // 2degrees (NZ) APN settings, change as required
+#endif
 
 Carloop<CarloopRevision2> carloop;
 
 bool SERIAL_DEBUG = false;  // turn this on to print current status on serial port - however this will stop the GPS from working
 
 int lastEventSent = 0;
-const int eventInterval = 300;
+const int eventInterval = 1100;
+
+int lastLocationSent = 0;
+const int locationInterval = 5;
 
 int lastWakeUp = 0;
 int lastMessage = 0;
@@ -66,7 +71,6 @@ String pollArgument;
 bool issueWake = false;
 
 bool issuePollLbc = false;
-bool issuePollObc = false;
 bool issuePollVcm = false;
 
 int isAwake = 0;
@@ -83,6 +87,7 @@ bool isConnected = false;
 int hasLocation = 0;
 double lat;
 double lng;
+int streamLocation = 0;
 
 String carState;
 String prndb;
@@ -90,7 +95,7 @@ String prndb;
 int hvGids = -1;
 double hvKwh = -1;
 int hvSoh = -1;
-double hvSoc = -1;
+int hvSoc = -1;
 bool hasDashboardSoc = false;
 double hvFullSoc = -1;
 double hvV = -1;
@@ -127,13 +132,19 @@ int doorFL = -1;
 
 int isLocked = -1;
 
+
 void setup()
 {
-    Serial.begin(9600);
+    #if Wiring_Cellular
+        Particle.keepAlive(300);
+    #endif
+    
+    if (SERIAL_DEBUG) {
+        Serial.begin(9600);
+    }
     
     // expose variables to particle's cloud (maximum of 20 allowed)
     Particle.variable("total_uptime", &uptime, INT);
-    Particle.variable("connected_uptime", &connectedUptime, INT);
     Particle.variable("signal_strength", &strength, DOUBLE);
     
     Particle.variable("acc_batt_v", &accBatteryVoltage, DOUBLE);
@@ -144,8 +155,9 @@ void setup()
     Particle.variable("gps_lock", &hasLocation, INT);
     Particle.variable("gps_lat", &lat, DOUBLE);
     Particle.variable("gps_lng", &lng, DOUBLE);
+    Particle.variable("stream_location", &streamLocation, INT);
 
-    Particle.variable("hv_soc", &hvSoc, DOUBLE);
+    Particle.variable("hv_soc", &hvSoc, INT);
     Particle.variable("hv_soh", &hvSoh, INT);
     Particle.variable("hv_kwh", &hvKwh, DOUBLE);
     Particle.variable("hv_temp_c", &hvTempC, DOUBLE);
@@ -158,6 +170,8 @@ void setup()
     Particle.variable("locked", &isLocked, INT);
 
     Particle.function("refresh", refreshCommand);
+    Particle.function("stream", streamCommand);
+    Particle.function("dfu", dfuCommand);
     
     // add CANBUS filters for just the messages we care about
     carloop.begin();
@@ -170,7 +184,6 @@ void setup()
     carloop.can().addFilter(0x5bf, 0x7ff);
     carloop.can().addFilter(0x79a, 0x7ff);
     carloop.can().addFilter(0x7bb, 0x7ff);
-    carloop.can().addFilter(0x793, 0x7ff);
     carloop.can().addFilter(0x60d, 0x7ff);
     carloop.can().addFilter(0x625, 0x7ff);
 }
@@ -180,13 +193,11 @@ void loop() {
     
     #if Wiring_WiFi
         WiFiSignal sig = WiFi.RSSI();
-        strength = (double)sig.getQuality();
-        quality = (double)sig.getQuality();
     #elif Wiring_Cellular
         CellularSignal sig = Cellular.RSSI();
-        strength = (double)sig.getStrength();
-        quality = (double)sig.getQuality();
     #endif
+    strength = (double)sig.getStrength();
+    quality = (double)sig.getQuality();
     
     bool wasConnected = isConnected;
     isConnected = Particle.connected();
@@ -208,15 +219,13 @@ void loop() {
     
     // automatically poll car systems when stopped or off
     if (isAllowedSend() && isAwake) {
-        // and when charging or car is on
-        if (isCharging || carState == "ON") {
-            autoPoll();
-        }
+        autoPoll();
     }
     
     String previousCarState = carState;
     String previousPrndb = prndb;
-    double previousSoc = hvSoc;
+    int prevHasLocation = hasLocation;
+    int previousSoc = hvSoc;
     
     // process any can messages
     int received = receive();
@@ -224,18 +233,30 @@ void loop() {
         lastMessage = Time.now();
     }
     
+    // update gps location
+    updateLocation();
+    if (hasLocation 
+        && (previousPrndb != prndb
+        || (streamLocation && lastLocationSent + locationInterval < uptime))) {
+        publishEvent("location", String(lat) + ", " + String(lng));
+        lastLocationSent = System.uptime();
+    }
+   
+    // update battery state of charge
+    if (previousSoc != hvSoc) {
+        publishEvent("hv_soc", String(hvSoc));
+    }
+    
+    if (previousCarState != carState && carState == "OFF") {
+        publishEvent("odo_km", String(odoKm));
+        publishEvent("hv_kwh", String(hvKwh));
+        publishEvent("range_km", String(range));
+        publishEvent("signal_strength", String(strength));
+        publishEvent("acc_batt_v", String(accBatteryVoltage));
+    }
+    
     // actively query controllers while car is stopped
     checkAwake();
-    
-    // update gps location
-    updateLocation(!wasConnected && isConnected
-        || (previousCarState != carState && carState == "ON")
-        || (previousPrndb != prndb && prndb == "P")); 
-    
-    // publish SoC when car turns on or off
-    if (hvSoc > 0 && previousCarState != carState && carState != "ACC") { 
-        publishEvent("soc", String(hvSoc));
-    }
     
     if (SERIAL_DEBUG) {
         publishSerial();
@@ -269,7 +290,7 @@ void publishSerial() {
     Serial.printlnf("Accessory Voltage %fV", accBatteryVoltage);
     Serial.printlnf("Car State %s", (const char *)carState);
     Serial.printlnf("PRNDB %s", (const char *)prndb);
-    Serial.printlnf("HV SOC %f", hvSoc);
+    Serial.printlnf("HV SOC %d", hvSoc);
     Serial.printlnf("HV SOH %d", hvSoh);
     Serial.printlnf("HV Energy %fkWh", hvKwh);
     Serial.printlnf("HV Voltage %fV", hvV);
@@ -296,25 +317,33 @@ void publishSerial() {
     Serial.printlnf("Locked %d", isLocked);
 }
 
-void updateLocation(bool forceSend) {
+void updateLocation() {
     // log gps coords
     WITH_LOCK(carloop.gps()) {
         if (carloop.gps().location.isValid()) {
-            String previousCarState = carState;
-            String previousPrndb = prndb;
-    
             lat = carloop.gps().location.lat();
             lng = carloop.gps().location.lng();
-            
-            if (!hasLocation || forceSend) {
-                publishEvent("location", String(lat) + ", " + String(lng));
-            }
             hasLocation = 1;
         }
         else {
             hasLocation = 0;
         }
     } 
+}
+
+int streamCommand(String command) {
+    if (command == "start") {
+        streamLocation = 1;
+    }
+    else {
+        streamLocation = 0;
+    }
+    return streamLocation;
+}
+
+int dfuCommand(String command) {
+    System.dfu();
+    return 1;
 }
 
 int receive() {
@@ -348,9 +377,6 @@ int receive() {
             case 0x79a:
                 parse79a(message.data);
                 break;
-            case 0x793:
-                parse793(message.data);
-                break;
             case 0x625:
                 parse625(message.data);
                 break;
@@ -369,8 +395,8 @@ void parse50d(unsigned char* data) {
         return;
     }
     
-    double soc = (double)data[0];
-    if (soc > 0 && soc != hvSoc) {
+    int soc = data[0];
+    if (soc > 0) {
         hvSoc = soc;
         hasDashboardSoc = true;
     }
@@ -432,7 +458,7 @@ void parse7bb(unsigned char* data) {
             hvHx = ((data[2] << 8) | data[3]) * 0.01;
             hvFullSoc = (((data[5] << 16) | data[6] << 8) | data[7]) * 0.0001;
             if (!hasDashboardSoc) {
-                hvSoc = hvFullSoc;
+                hvSoc = (int)hvFullSoc;
             }
             break;
         case 0x05:
@@ -443,34 +469,6 @@ void parse7bb(unsigned char* data) {
     }
     if (isAllowedSend()) {
         pollLbc(true);  // query next page
-    }
-}
-
-void parse793(unsigned char* data) {
-    // response from OBC 792   --  this may or may not actually work
-    int group1 = data[2];
-    int group2 = data[3];
-    int wasCharging = isCharging;
-    switch (group1) {
-            switch(group2) {
-                case 0x42:
-                    isChargingAc = data[4] != 0x00; // is charging?
-                    isCharging = isChargingAc || isChargingQc;
-                    if (wasCharging != isCharging) {
-                        if (isCharging) {
-                            publishEvent("charge", "ac");
-                        }
-                        else {
-                            publishEvent("charge", "stop");
-                        }
-                    }
-                    break;
-                default:
-                    break;
-            }
-            break;
-        default:
-            break;
     }
 }
 
@@ -498,15 +496,15 @@ void parse79a(unsigned char* data) {
             switch (group2) {
                 case 0x03:
                     dcqc = data[5];
-                    if (dcqc == prevDcqc + 1) {
+                    if (dcqc != prevDcqc) {
                         publishEvent("dc_qc", String(dcqc));
                     }
                     break;
                 case 0x05:    
                     l2l1 = (data[4] << 8) | data[5];
-                    if (l2l1 == prevL1l2 + 1) {
+                    if (l2l1 != prevL1l2) {
                         // seems to increment when charge begins (not just when the cable is connected)
-                        publishEvent("l2_lq", String(l2l1));
+                        publishEvent("l2_l1", String(l2l1));
                     }
                     break;
                 default:
@@ -636,15 +634,11 @@ void autoPoll() {
     if (currentTime - lastPoll >= pollInterval) {
         lastPoll = currentTime;
         issuePollLbc = true;
-        issuePollObc = true;
         issuePollVcm = true;
     }
     
     if (issuePollLbc) {
         pollLbc(false);
-    }   
-    if (issuePollObc) {
-        pollObc(false);
     }   
     if (issuePollVcm) {
         pollVcm(false);
@@ -653,7 +647,6 @@ void autoPoll() {
 
 int refreshCommand(String command) {
     issuePollLbc = true;
-    issuePollObc = true;
     issuePollVcm = true;
     return 1;
 }
@@ -689,30 +682,6 @@ void pollLbc(bool nextPage) {
     }
     
     carloop.can().transmit(message);
-}
-
-void pollObc(bool nextPage) {
-    issuePollObc = false;
-    int interval = 10;
-    
-    CANMessage message;
-    message.id = 0x792; 
-    message.len = 8;
-    message.rtr = false;
-    message.extended = false;
-    
-    // check if charging
-    message.data[0] = 0x03;
-    message.data[1] = 0x22;
-    message.data[2] = 0x11;
-    message.data[3] = 0x42;
-    message.data[4] = 0x00;
-    message.data[5] = 0x00;
-    message.data[6] = 0x00;
-    message.data[7] = 0x00;
-    carloop.can().transmit(message);
-    
-    delay(interval);
 }
 
 void pollVcm(bool nextPage) {
